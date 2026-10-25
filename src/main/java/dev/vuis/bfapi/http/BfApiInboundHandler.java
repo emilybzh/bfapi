@@ -39,6 +39,9 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
@@ -51,17 +54,53 @@ import lombok.extern.slf4j.Slf4j;
 @ChannelHandler.Sharable
 public final class BfApiInboundHandler extends SimpleChannelInboundHandler<FullHttpRequest> {
 	private static final int MAX_BULK_SIZE = 60;
+	private static final int MAX_CONCURRENT_REQUESTS = 64;
 
 	public final AtomicReference<BfConnection> connectionReference = new AtomicReference<>();
 	public final AtomicReference<UnofficialCloudData> ucdReference = new AtomicReference<>();
 
 	private final String ucdRefreshSecret;
+	private final ExecutorService requestExecutor = Executors.newVirtualThreadPerTaskExecutor();
+	private final Semaphore inFlight = new Semaphore(MAX_CONCURRENT_REQUESTS, true);
 
 	@Override
 	protected void channelRead0(ChannelHandlerContext ctx, FullHttpRequest msg) {
+		boolean keepAlive = HttpUtil.isKeepAlive(msg);
+
+		if (!inFlight.tryAcquire()) {
+			FullHttpResponse response = BfApiError.SERVER_BUSY.response(ctx, msg);
+			response.headers().set(HttpHeaderNames.RETRY_AFTER, "1");
+			writeResponse(ctx, response, keepAlive);
+			return;
+		}
+
+		// The HTTP event loop must never wait on the cloud connection. Retain the
+		// request until the worker is done because SimpleChannelInboundHandler
+		// releases it as soon as this method returns.
+		msg.retain();
+		try {
+			requestExecutor.execute(() -> {
+				try {
+					handleRequest(ctx, msg, keepAlive);
+				} catch (Throwable t) {
+					log.error("unhandled error while handling {} {}", msg.method(), msg.uri(), t);
+					writeResponse(ctx, BfApiError.INTERNAL_ERROR.response(ctx, msg), keepAlive);
+				} finally {
+					msg.release();
+					inFlight.release();
+				}
+			});
+		} catch (Throwable t) {
+			msg.release();
+			inFlight.release();
+			log.error("failed to submit request {}", msg.uri(), t);
+			writeResponse(ctx, BfApiError.SERVER_BUSY.response(ctx, msg), keepAlive);
+		}
+	}
+
+	private void handleRequest(ChannelHandlerContext ctx, FullHttpRequest msg, boolean keepAlive) {
 		QueryStringDecoder qs = new QueryStringDecoder(msg.uri());
 		String path = qs.path();
-		boolean keepAlive = HttpUtil.isKeepAlive(msg);
 
 		HttpResponse response = switch (path) {
 			case "/api/v1/clan_data" -> clanData(ctx, msg, qs);
@@ -88,7 +127,10 @@ public final class BfApiInboundHandler extends SimpleChannelInboundHandler<FullH
 		}
 
 		log.info("{} {} - {}", msg.method(), msg.uri(), response.status().code());
+		writeResponse(ctx, response, keepAlive);
+	}
 
+	private static void writeResponse(ChannelHandlerContext ctx, HttpResponse response, boolean keepAlive) {
 		if (keepAlive) {
 			response.headers().set(HttpHeaderNames.CONNECTION, HttpHeaderValues.KEEP_ALIVE);
 			ctx.writeAndFlush(response);

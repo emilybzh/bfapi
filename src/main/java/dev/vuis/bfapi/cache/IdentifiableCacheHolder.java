@@ -12,6 +12,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
@@ -19,6 +20,9 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 public class IdentifiableCacheHolder<K, V> {
+	private static final long MAX_CACHE_SIZE = 10_000;
+	private static final long PENDING_TIMEOUT_SECONDS = 60;
+
 	protected final @NotNull Consumer<Set<K>> requester;
 	protected final @NotNull Duration lifetime;
 	private final @Nullable BiConsumer<K, V> completeListener;
@@ -37,6 +41,7 @@ public class IdentifiableCacheHolder<K, V> {
 		this.completeListener = completeListener;
 
 		this.cache = CacheBuilder.newBuilder()
+			.maximumSize(MAX_CACHE_SIZE)
 			.expireAfterWrite(lifetime)
 			.build();
 	}
@@ -45,7 +50,11 @@ public class IdentifiableCacheHolder<K, V> {
 		var future = createFuture(key);
 
 		if (future.rightBoolean()) {
-			request(key, false);
+			try {
+				request(key, false);
+			} catch (RuntimeException e) {
+				fail(key, future.left(), e);
+			}
 		}
 
 		return future.left();
@@ -64,9 +73,23 @@ public class IdentifiableCacheHolder<K, V> {
 			}
 		}
 
-		request(requestKeys, false);
+		try {
+			request(requestKeys, false);
+		} catch (RuntimeException e) {
+			for (K key : requestKeys) {
+				CompletableFuture<ExpiryHolder<V>> future = futures.get(key);
+				if (future != null) {
+					fail(key, future, e);
+				}
+			}
+		}
 
 		return futures;
+	}
+
+	private void fail(K key, CompletableFuture<ExpiryHolder<V>> future, RuntimeException e) {
+		future.completeExceptionally(e);
+		pending.remove(key, future);
 	}
 
 	private ObjectBooleanPair<CompletableFuture<ExpiryHolder<V>>> createFuture(K key) {
@@ -76,12 +99,13 @@ public class IdentifiableCacheHolder<K, V> {
 		}
 
 		CompletableFuture<ExpiryHolder<V>> newFuture = new CompletableFuture<>();
-		newFuture.whenComplete((_, _) -> pending.remove(key));
-
 		CompletableFuture<ExpiryHolder<V>> existing = pending.putIfAbsent(key, newFuture);
 		if (existing != null) {
 			return ObjectBooleanPair.of(existing, false);
 		}
+
+		newFuture.orTimeout(PENDING_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+		newFuture.whenComplete((_, _) -> pending.remove(key, newFuture));
 
 		return ObjectBooleanPair.of(newFuture, true);
 	}
@@ -133,9 +157,10 @@ public class IdentifiableCacheHolder<K, V> {
 
 	public synchronized void purge() {
 		cache.invalidateAll();
-		for (CompletableFuture<ExpiryHolder<V>> future : pending.values()) {
-			future.completeExceptionally(new PurgeException());
+		for (Map.Entry<K, CompletableFuture<ExpiryHolder<V>>> entry : pending.entrySet()) {
+			if (pending.remove(entry.getKey(), entry.getValue())) {
+				entry.getValue().completeExceptionally(new PurgeException());
+			}
 		}
-		pending.clear();
 	}
 }

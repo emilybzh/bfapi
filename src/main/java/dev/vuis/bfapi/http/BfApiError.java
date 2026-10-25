@@ -17,6 +17,7 @@ import static io.netty.handler.codec.http.HttpResponseStatus.INTERNAL_SERVER_ERR
 import static io.netty.handler.codec.http.HttpResponseStatus.METHOD_NOT_ALLOWED;
 import static io.netty.handler.codec.http.HttpResponseStatus.NOT_FOUND;
 import static io.netty.handler.codec.http.HttpResponseStatus.SERVICE_UNAVAILABLE;
+import static io.netty.handler.codec.http.HttpResponseStatus.TOO_MANY_REQUESTS;
 
 @RequiredArgsConstructor(access = AccessLevel.PRIVATE)
 public final class BfApiError {
@@ -35,6 +36,7 @@ public final class BfApiError {
 	public static final BfApiError PACKET_TIMEOUT = new BfApiError(GATEWAY_TIMEOUT, "packet_timeout");
 	public static final BfApiError REFRESH_IN_PROGRESS = new BfApiError(CONFLICT, "refresh_in_progress");
 	public static final BfApiError SERIALIZATION_ERROR = new BfApiError(INTERNAL_SERVER_ERROR, "serialization_error");
+	public static final BfApiError SERVER_BUSY = new BfApiError(TOO_MANY_REQUESTS, "server_busy");
 	public static final BfApiError UCD_UNAVAILABLE = new BfApiError(SERVICE_UNAVAILABLE, "ucd_unavailable");
 	public static final BfApiError UUID_SET_TOO_LARGE = new BfApiError(BAD_REQUEST, "uuid_set_too_large");
 
